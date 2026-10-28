@@ -1,167 +1,76 @@
 import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta
 
-# --- Configuration ---
-# Seed for reproducible "random" market behavior across app reloads
-np.random.seed(42)
+GOODS = {
+    "Tomatoes": dict(kind="farm crop", unit="kg", verb="sell", p0=28, c0=17, eps=0.7, sig=0.9, dem_amp=0.05, dem_peak=12, sup_amp=0.18, sup_peak=2,
+                     hold=0.05, vol=1.0, now="Sell now", ing="selling", noun="kg", qty=200, cost_q="What does it cost you to grow and bring 1 kg to market?", price_q="What price per kg are you asking?",
+                     qty_q="How many kg do you have to sell?", hold_why="spoilage and storage"),
+    "Handmade candles": dict(kind="handmade product", unit="piece", verb="sell", p0=180, c0=95, eps=1.1, sig=1.3, dem_amp=0.30, dem_peak=10.5, sup_amp=0.03,
+                             sup_peak=6, hold=0.01, vol=0.8, now="Sell now", ing="selling", noun="candle", qty=60, cost_q="What does one candle cost you in materials, labour and packing?",
+                             price_q="What are you charging per candle?", qty_q="How many candles are in stock?", hold_why="storage and tied-up cash"),
+    "Room for rent": dict(kind="rental", unit="month", verb="let", p0=9000, c0=4200, eps=0.6, sig=0.5, dem_amp=0.12, dem_peak=7.5, sup_amp=0.03, sup_peak=1,
+                          hold=0.09, vol=0.45, now="Let it out now", ing="letting it out", noun="room", qty=1, cost_q="What does the room cost you per month (upkeep, loan interest, tax)?",
+                          price_q="What rent are you asking per month?", qty_q="How many rooms are you letting?", hold_why="rent lost while it stays empty"),
+}
+DEMAND_OPTIONS = {"Much weaker than usual": 0.70, "Weaker than usual": 0.85, "Normal": 1.0, "Stronger than usual": 1.15, "Much stronger than usual": 1.30}
+COMP_OPTIONS = {"Far fewer sellers than usual": 0.75, "Fewer sellers": 0.88, "Usual number of sellers": 1.0, "More sellers": 1.15, "Flooded with sellers": 1.35}
+LAMBDA, NOISE, THETA = 0.55, 0.02, 0.1
+EVENTS = [("Input costs jumped", 0, (1.15, 1.5), (3, 9)), ("Demand dipped", 1, (0.65, 0.85), (2, 7)),
+          ("Demand surged", 1, (1.15, 1.35), (2, 6)), ("More sellers entered", 2, (1.2, 1.45), (3, 9))]
+CORR = np.array([[1, -0.2, 0], [-0.2, 1, -0.1], [0, -0.1, 1]])
+VOLS = np.array([0.025, 0.03, 0.025])
 
-def generate_dates(start_date, months):
-    """Generates a list of monthly timestamps."""
-    return [start_date + timedelta(days=30 * i) for i in range(months)]
 
-def random_walk(steps, start_val, volatility, drift=0.0):
-    """
-    Generates a Geometric Brownian Motion series.
-    Safeguarded with np.maximum to prevent negative economic factors.
-    """
-    # Generate percent changes (normal distribution)
-    pct_change = np.random.normal(drift, volatility, steps)
-    
-    # Cumulative product to create the 'walk' path
-    path = start_val * np.cumprod(1 + pct_change)
-    
-    # Economics Safety: Factors cannot drop below 0.1 (10% of baseline)
-    return np.maximum(path, 0.1)
+def equilibrium(good, cost, demand, comp, month):
+    g = GOODS[good]
+    ang = lambda pk: 2 * np.pi * (np.asarray(month) - pk) / 12
+    D = demand * (1 + g["dem_amp"] * np.cos(ang(g["dem_peak"])))
+    K = comp * (1 + g["sup_amp"] * np.cos(ang(g["sup_peak"])))
+    lD = 0.35 * np.tanh(np.log(D) / 0.35)
+    lK = np.log(K)
+    lK = lK + 3 * np.maximum(0, lK - 0.12) ** 2
+    x = np.log(np.asarray(cost) / g["c0"])
+    h = x + 1.2 * np.maximum(0, x - 0.15) ** 2
+    return g["p0"] * np.exp((lD - lK + g["sig"] * h) / (g["eps"] + g["sig"]))
 
-def seasonality_factor(months, peak_month, amplitude):
-    """
-    Creates a cyclical multiplier centered at 1.0.
-    peak_month: 0-11 (Jan-Dec)
-    """
-    x = np.arange(months)
-    # Cosine wave formula adjusted so the peak aligns with peak_month
-    cycle = np.cos((x - peak_month) * 2 * np.pi / 12)
-    return 1 + amplitude * cycle
 
-def inject_shocks(data, probability, magnitude_range):
-    """
-    Injects sudden market events (spikes or crashes).
-    magnitude_range: tuple (min_impact, max_impact) e.g., (-0.2, 0.2)
-    """
-    # 1. Decide where shocks happen
-    shock_mask = np.random.rand(len(data)) < probability
-    
-    # 2. Determine magnitude for each shock
-    low, high = magnitude_range
-    magnitudes = np.random.uniform(low, high, size=len(data))
-    
-    # 3. Apply only where mask is True
-    multipliers = np.where(shock_mask, 1 + magnitudes, 1.0)
-    return data * multipliers
+FORCED = {0: (1.6, 8), 1: (0.55, 6), 2: (1.6, 5), 3: (1.7, 8)}
 
-def calculate_equilibrium(base_cost, demand, supply, seasonality):
-    """
-    The Core Economic Formula:
-    Price = Cost * (Demand / Supply) * Seasonality
-    """
-    return base_cost * (demand / supply) * seasonality
 
-def generate_good_history(name, params, months=60):
-    """
-    Simulates the specific economics of a single good over time.
-    """
-    # Start simulation 5 years ago from today to provide history
-    start_date = datetime.now() - timedelta(days=months*30)
-    dates = generate_dates(start_date, months)
-    
-    # 1. Generate Fundamental Factors (Random Walks)
-    # Costs move with inflation/materials
-    cost_base = random_walk(months, params['base_cost'], params['cost_vol'], drift=0.002) 
-    # Demand drifts slightly (popularity)
-    demand = random_walk(months, 1.0, params['demand_vol'], drift=params['demand_drift'])
-    # Supply is reactive or steady
-    supply = random_walk(months, 1.0, params['supply_vol'])
-    
-    # 2. Apply Seasonality (Predictable cycles)
-    seasonal_mult = seasonality_factor(months, params['peak_month'], params['seasonal_amp'])
-    
-    # 3. Inject Real-World Shocks (Unpredictable events)
-    # Supply shocks (droughts, shortages) usually spike costs
-    cost_base = inject_shocks(cost_base, params['shock_prob'], (0.1, 0.3)) 
-    # Demand shocks (viral trends, recessions)
-    demand = inject_shocks(demand, params['shock_prob'], (-0.2, 0.2))
-    
-    # 4. Calculate True Equilibrium Price (The "Fair" Price)
-    true_price = calculate_equilibrium(cost_base, demand, supply, seasonal_mult)
-    
-    # 5. Generate Market Price with "Stickiness"
-    # Market prices rarely jump instantly to equilibrium; they lag.
-    market_price = np.zeros(months)
-    market_price[0] = true_price[0]
-    
-    for t in range(1, months):
-        alpha = params['stickiness'] # 0.0 = instant adjustment, 1.0 = never changes
-        
-        # The market tries to find the true price, but has noise (trader emotion)
-        noise = np.random.normal(0, 0.02) # 2% noise
-        target = true_price[t] * (1 + noise)
-        
-        # Update rule: Old Price * Alpha + New Target * (1 - Alpha)
-        market_price[t] = (alpha * market_price[t-1]) + ((1 - alpha) * target)
+def simulate(good, months=60, seed=0, start_month=1, event_prob=0.07, force=None):
+    g, rng, chol = GOODS[good], np.random.default_rng(seed), np.linalg.cholesky(CORR)
+    dev, active, rows, lnp = np.zeros(3), [], [], None
+    for t in range(months):
+        cal = (start_month - 1 + t) % 12 + 1
+        dev = dev * (1 - THETA) + g["vol"] * VOLS * (chol @ rng.standard_normal(3))
+        started = ""
+        if rng.random() < event_prob:
+            name, idx, (a, b), (d0, d1) = EVENTS[rng.integers(len(EVENTS))]
+            active.append([name, idx, rng.uniform(a, b), int(rng.integers(d0, d1))])
+            started = name
+        if force and t == force[0]:
+            name, idx = EVENTS[force[1]][0], EVENTS[force[1]][1]
+            active.append([name, idx, FORCED[force[1]][0], FORCED[force[1]][1]])
+            started = name
+        mult = np.ones(3)
+        for a in active:
+            mult[a[1]] *= a[2] ** g["vol"]
+        cost, demand, comp = g["c0"] * np.exp(dev[0]) * mult[0], np.exp(dev[1]) * mult[1], np.exp(dev[2]) * mult[2]
+        fair = float(equilibrium(good, cost, demand, comp, cal))
+        lnp = np.log(fair) if lnp is None else (1 - LAMBDA) * lnp + LAMBDA * np.log(fair)
+        rows.append(dict(t=t, month=cal, cost=float(cost), demand=float(demand), comp=float(comp), fair=fair,
+                         price=float(np.exp(lnp + rng.normal(0, NOISE))), event=started, active=bool(active)))
+        for a in active:
+            a[3] -= 1
+        active = [a for a in active if a[3] > 0]
+    return pd.DataFrame(rows)
 
-    # 6. Formatting
-    return pd.DataFrame({
-        'date': dates,
-        'good': name,
-        'market_price': np.round(market_price, 2),
-        'true_equilibrium': np.round(true_price, 2),
-        'cost_factor': np.round(cost_base, 2),
-        'demand_factor': np.round(demand, 2),
-        'supply_factor': np.round(supply, 2),
-        'seasonality': np.round(seasonal_mult, 3)
-    })
 
-def get_simulation_data():
-    """
-    Main entry point. Returns a combined DataFrame for all product types.
-    """
-    # Distinct economic profiles for realistic variety
-    configs = {
-        'Organic Wheat (Crop)': {
-            'base_cost': 220, 
-            'cost_vol': 0.03,    # High cost volatility (fertilizer/fuel)
-            'demand_vol': 0.05, 
-            'demand_drift': 0.001,
-            'supply_vol': 0.06,  # Volatile supply (weather)
-            'peak_month': 6,     # Summer harvest
-            'seasonal_amp': 0.25,# Strong seasonality
-            'shock_prob': 0.05,  # Frequent shocks
-            'stickiness': 0.2    # Low stickiness (commodity market moves fast)
-        },
-        'Handmade Table (Product)': {
-            'base_cost': 450, 
-            'cost_vol': 0.01,    # Stable material costs
-            'demand_vol': 0.03, 
-            'demand_drift': 0.002,
-            'supply_vol': 0.01, 
-            'peak_month': 11,    # Christmas rush
-            'seasonal_amp': 0.15,
-            'shock_prob': 0.02,  # Rare shocks
-            'stickiness': 0.5    # Medium stickiness (retail pricing)
-        },
-        'Studio Apt (Rent)': {
-            'base_cost': 1200, 
-            'cost_vol': 0.002,   # Very stable costs (mortgage/tax)
-            'demand_vol': 0.02, 
-            'demand_drift': 0.004, # Rising rent trend
-            'supply_vol': 0.005, 
-            'peak_month': 8,     # August move-ins
-            'seasonal_amp': 0.05,# Low seasonality
-            'shock_prob': 0.01,  # Very rare shocks
-            'stickiness': 0.9    # High stickiness (12-month leases)
-        }
-    }
+def training_paths(good, n=48, months=60, seed=1000):
+    rng = np.random.default_rng(seed)
+    parts = [simulate(good, months, int(rng.integers(1 << 30)), int(rng.integers(1, 13))).assign(path=i) for i in range(n)]
+    return pd.concat(parts, ignore_index=True)
 
-    all_data = []
-    for name, params in configs.items():
-        df = generate_good_history(name, params)
-        all_data.append(df)
-    
-    return pd.concat(all_data, ignore_index=True)
 
-if __name__ == "__main__":
-    # Self-test if run directly
-    df = get_simulation_data()
-    print(f"Simulation Complete. Generated {len(df)} rows.")
-    print(df.groupby('good').tail(2)[['date', 'good', 'market_price', 'true_equilibrium']])
+def nearest_option(options, value):
+    return min(options, key=lambda k: abs(options[k] - value))
