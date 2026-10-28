@@ -1,115 +1,85 @@
-"""
-Advisor Module
-Acts as the 'Translator' between raw Neural Network outputs and human business strategy.
-It converts probabilities and float values into actionable verdicts and risk assessments.
-"""
+import calendar
+import math
+import numpy as np
+from simulator import GOODS
 
-def compare_to_fair(user_price, fair_price):
-    """
-    Analyzes the gap between User's Asking Price and the Model's Equilibrium Price.
-    Returns a dictionary with status, plain-English reasoning, and specific tips.
-    """
-    # 1. Calculate the Gap
-    if fair_price == 0: 
-        fair_price = 0.01 # Prevent zero division
-        
-    diff = user_price - fair_price
-    percent_diff = (diff / fair_price) * 100
-    gap_abs = round(abs(percent_diff), 1)
-    
-    # 2. Determine Verdict based on sensitivity thresholds
-    # We use tiers: Perfect (<2%), Fair (<6%), High/Low (6-15%), Extreme (>15%)
-    
-    if abs(percent_diff) <= 2.0:
-        status = "Perfectly Aligned"
-        reason = "Your price matches the theoretical market equilibrium exactly."
-        tip = "Great pricing. Focus on marketing your quality to close the sale."
-        
-    elif abs(percent_diff) <= 6.0:
-        status = "Fair"
-        reason = f"You are within a normal trading range ({gap_abs}% variance)."
-        tip = "This is a competitive price. You should see standard turnover."
-        
-    elif percent_diff > 6.0 and percent_diff <= 15.0:
-        status = "Premium Pricing"
-        reason = f"You are {gap_abs}% above the fair market value."
-        tip = "Ensure your product has visible 'value-adds' (branding, service, quality) to justify this premium."
-        
-    elif percent_diff > 15.0:
-        status = "Overpriced"
-        reason = f"You are significantly ({gap_abs}%) above the market equilibrium."
-        tip = "High risk of being undercut by competitors. Consider lowering price unless your product is unique."
-        
-    elif percent_diff < -6.0 and percent_diff >= -15.0:
-        status = "Value Pricing"
-        reason = f"You are {gap_abs}% below the fair market value."
-        tip = "This will attract quick sales, but ensure you aren't eroding your profit margins unnecessarily."
-        
-    else: # percent_diff < -15.0
-        status = "Underpriced"
-        reason = f"You are {gap_abs}% below equilibrium. You may be leaving money on the table."
-        tip = "Unless you need to liquidate cash immediately, consider raising your price."
+FAIR_TOL, WAIT_GAIN, SELL_LOSS = 0.04, 0.025, -0.005
+DRIVER_NAMES = {"cost": "Your cost", "demand": "Demand", "competition": "Competition", "season": "Time of year"}
 
-    return {
-        "status": status,
-        "gap_percent": gap_abs,
-        "reason": reason,
-        "strategic_tip": tip,
-        "fair_price": round(fair_price, 2)
-    }
 
-def sell_or_wait(trend_result):
-    """
-    Translates TrendNet technical signals into a binary business decision.
-    Input: trend_result dict {direction, confidence, magnitude_percent}
-    """
-    direction = trend_result['direction']
-    confidence = trend_result['confidence']
-    magnitude = trend_result['magnitude_percent']
-    
-    # Defaults
-    action = "Hold"
-    reason = "Market signals are mixed."
-    risk = "Standard market volatility applies."
-    
-    # 1. Logic for "Rise" (Bullish)
-    if direction == "Rise":
-        if confidence > 75:
-            action = "Wait"
-            reason = f"Strong upward momentum detected. Prices projected to gain ~{magnitude}% soon."
-            risk = "Risk: Holding costs (storage/spoilage) must be lower than the expected ~{magnitude}% gain."
-        elif confidence > 50:
-            action = "Wait (Cautious)"
-            reason = "Market is leaning upward, but signals are not definite."
-            risk = "Risk: Trend is weak. Monitor closely; sell if momentum stalls."
-        else:
-            action = "List Normally"
-            reason = "Slight upward bias, but insufficient confidence to delay sales."
-            risk = "Risk: Noise in the market may mimic a trend."
+def inr(v):
+    v = float(v)
+    if abs(v) < 100:
+        s = f"{abs(v):,.1f}"
+        return ("-" if v < 0 else "") + "₹" + (s[:-2] if s.endswith(".0") else s)
+    s = str(int(round(abs(v))))
+    head, tail = s[:-3], s[-3:]
+    while len(head) > 2:
+        tail, head = head[-2:] + "," + tail, head[:-2]
+    return ("-" if v < 0 else "") + "₹" + (head + "," if head else "") + tail
 
-    # 2. Logic for "Fall" (Bearish)
-    elif direction == "Fall":
-        if confidence > 75:
-            action = "Sell Now"
-            reason = f"Negative momentum detected. Prices likely to drop ~{magnitude}%."
-            risk = "Risk: Selling now locks in value. Waiting risks further depreciation."
-        elif confidence > 50:
-            action = "Sell Soon"
-            reason = "Market is softening. It is safer to secure liquidity now."
-            risk = "Risk: Potential to miss a 'dead cat bounce' (temporary recovery), but downside risk is higher."
-        else:
-            action = "List Normally"
-            reason = "Slight downward bias, but not enough to panic sell."
-            risk = "Risk: Market is choppy."
 
-    # 3. Logic for "Flat" (Stagnant)
+def nice(v):
+    step = 50 if v >= 1000 else 5 if v >= 100 else 0.5
+    return round(v / step) * step
+
+
+def confidence_label(p):
+    return "high" if p >= 0.7 else "medium" if p >= 0.5 else "low"
+
+
+def count(qty, good):
+    n = GOODS[good]["noun"]
+    return f"{int(qty):,} {n}" + ("s" if int(qty) != 1 and n != "kg" else "")
+
+
+def compare_to_fair(good, user_price, fair, cost, market_price):
+    lo, hi = min(fair["low"], fair["price"] * (1 - FAIR_TOL)), max(fair["high"], fair["price"] * (1 + FAIR_TOL))
+    gap = user_price / fair["price"] - 1
+    status = "underpriced" if user_price < lo else "overpriced" if user_price > hi else "fair"
+    floor = cost * 1.05
+    sug = {"underpriced": nice(fair["price"]), "overpriced": nice(hi), "fair": user_price}[status]
+    return {"status": status, "gap_pct": gap, "margin_pct": (user_price - cost) / user_price, "suggested": max(sug, floor) if status != "fair" else sug,
+            "floor": floor, "low": lo, "high": hi, "underwater": fair["price"] < cost * 1.03}
+
+
+def verdict_line(v):
+    gap = abs(v["gap_pct"]) * 100
+    if v["status"] == "fair":
+        return "Fair price."
+    return f"{'Underpriced' if v['status'] == 'underpriced' else 'Above fair price'} by {gap:.0f}%. Suggested price: {inr(v['suggested'])}."
+
+
+def drivers_table(fair):
+    return [(DRIVER_NAMES[n], f"{d * 100:+.1f}%") for n, d in fair["drivers"]]
+
+
+def sell_or_wait(good, outlook, price_now, qty, horizon):
+    g = GOODS[good]
+    base = {"horizon": horizon, "qty": qty, "now_value": qty * price_now, "scenarios": None, "risk": ""}
+    if horizon == 0:
+        return {**base, "action": "sell_now", "label": g["now"], "net_gain_pct": 0.0, "confidence": outlook[1]["confidence"],
+                "line": "This week: no time to wait. Use the fair price as your guide."}
+    o = outlook[horizon]
+    hold = g["hold"] * horizon
+    net = o["change_pct"] - hold
+    p_pos = 1 - 0.5 * (1 + math.erf(((math.log(1 + hold) - o["mu"]) / o["sd"]) / math.sqrt(2)))
+    scen = {"now": qty * price_now, "expected": qty * price_now * (1 + net), "bad": qty * price_now * (1 + o["low_pct"] - hold),
+            "good": qty * price_now * (1 + o["high_pct"] - hold)}
+    if net >= WAIT_GAIN and p_pos >= 0.6:
+        act, label = "wait", "Wait"
+    elif net <= SELL_LOSS or p_pos < 0.4:
+        act, label = "sell_now", g["now"]
     else:
-        action = "List / Hold"
-        reason = "Market is stable with low volatility."
-        risk = "Risk: Capital tied up in inventory is not generating a return ('Opportunity Cost')."
+        act, label = ("split", "Split: sell half now") if qty > 1 else ("sell_now", g["now"])
+    conf = o["probs"][o["direction"]]
+    return {**base, "action": act, "label": label, "net_gain_pct": net, "confidence": conf, "direction": o["direction"], "scenarios": scen,
+            "line": f"{label}. Expected {net * 100:+.0f}% over {horizon} month{'s' if horizon > 1 else ''} after allowing for {g['hold_why']} ({confidence_label(conf)} confidence).",
+            "risk": f"Chance that waiting is worse than {g['ing']} today: {min(95, max(5, round((1 - p_pos) * 100)))}%."}
 
-    return {
-        "action": action,
-        "reason": reason,
-        "risk_note": risk
-    }
+
+def year_outlook(fair_model, cost, demand, comp, month0):
+    months = [(month0 - 1 + i) % 12 + 1 for i in range(12)]
+    g = GOODS[fair_model.good]
+    prices = fair_model.predict_many(np.full(12, np.clip(cost, 0.5 * g["c0"], 2 * g["c0"])), np.full(12, demand), np.full(12, comp), months)[0]
+    return [calendar.month_abbr[m] for m in months], prices
