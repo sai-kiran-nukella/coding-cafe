@@ -1,50 +1,55 @@
-# PriceWise ⚖️
-**A Pricing & Timing Tool for Small Sellers**
+PRICEWISE
+=========
+A tool for small sellers (farmers, shopkeepers, makers, landlords) that answers two questions:
+  1. Is my price fair?
+  2. Should I sell now or wait?
 
-### What is this?
-Pricing is a headache. Whether you're selling wheat, handmade tables, or renting out an apartment, you usually have two questions:
-1. "Am I charging a fair price?" (Or am I ripping myself off?)
-2. "Should I sell now, or wait for the price to go up?"
+Two neural networks, written from scratch in NumPy, make the predictions.
+Prices are simulated for now. Real market data is the next step.
 
-PriceWise answers those questions. Instead of showing you a bunch of confusing charts and making you guess, it uses two small neural networks to crunch the numbers and give you a straight answer: "Underpriced," "Sell Now," or "Wait."
 
----
+HOW TO RUN
+----------
+1. pip install -r requirements.txt
+2. streamlit run app.py
+3. Tests: python -m unittest tests/test_core.py
 
-### How to Run It
+The first run trains the models (about 15 seconds) and saves them in the .cache folder.
 
-1. **Get the libraries**
-   Open your terminal and install the basics:
-   pip install -r requirements.txt
 
-2. **Start the app**
-   Run the main file:
-   streamlit run app.py
+HOW TO USE
+----------
+Enter your product, cost, price, quantity, demand, competition and urgency in the sidebar.
+You can also upload a CSV of your own monthly prices (needs a "price" column, at least 6 rows).
 
-   (This should pop open a browser window automatically.)
+The page has three sections:
+  1. Is your price fair?       Fair price, range, margin, profit, suggested price.
+  2. Sell now or wait?         Advice, income table, 12 month outlook, price forecast.
+  3. How the model learned     Live training, and a shock test that shows the model repairing itself.
 
-3. **Check the math (Optional)**
-   If you want to make sure the AI isn't hallucinating, run the tests:
-   python tests/test_core.py
 
----
+FILES
+-----
+simulator.py         Pretend market: supply, demand, seasons, shocks. Creates the training data.
+market_feed.py       Gives the app the price history. Also reads your CSV.
+nn.py                Neural network from scratch, ensemble of 5, straight-line baseline.
+fair_price_net.py    Predicts the fair price from cost, demand, competition and month.
+trend_net.py         Predicts whether the price will rise, fall or stay flat in 1-2 months.
+models.py            Trains both models per product and caches them.
+advisor.py           Turns predictions into verdicts, advice, income table and outlook.
+learning_demo.py     Live training and the shock test with self-repair.
+charts.py            Plots.
+app.py               The Streamlit page.
+tests/test_core.py   15 automatic checks.
 
-### What's Inside?
 
-Here’s a quick breakdown of the files so you know where to look:
+HOW IT FITS TOGETHER
+--------------------
+simulator -> training data -> nn + fair_price_net + trend_net (via models)
+-> advisor (decisions) -> app (page, with charts and learning demo)
 
-*   **app.py**: The main interface. This handles the buttons, inputs, and draws the charts.
-*   **simulator.py**: Since we don't have a live feed of USDA crop prices or Zillow rent data yet, this script generates "fake" history that behaves like the real world (seasons, inflation, random shocks).
-*   **fair_price_net.py**: The first brain. It looks at costs + supply + demand to figure out what the "Fair" price actually is.
-*   **trend_net.py**: The second brain. It looks at the last few months of history to guess if prices are going up or down next month.
-*   **advisor.py**: The translator. It takes the complicated math from the AI and turns it into plain English advice like "Risk: High probability of being undercut."
-*   **theme.py**: Just the styling settings to make it look clean and professional (no default Streamlit visuals).
 
----
-
-### Real Talk (Limitations)
-
-Right now, PriceWise runs on **simulated data**.
-
-I built `simulator.py` to be realistic—prices go up when demand is high, they crash when there's an oversupply, and they follow seasonal trends—but it is **not** pulling live market data from the internet.
-
-To make this a "real" product, you'd just need to swap out `simulator.py` for a script that scrapes real pricing data (like from Etsy, Zillow, or a commodities API). The AI models wouldn't even need to change; you'd just retrain them on the real CSV files.
+LIMITS
+------
+All prices are simulated, so accuracy figures describe the simulator and will be lower on real data.
+This is guidance, not financial advice.
