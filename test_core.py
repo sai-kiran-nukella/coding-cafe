@@ -77,3 +77,83 @@ class TestLoader(unittest.TestCase):
             D.build_market("s.csv", short)
 
 
+class TestFeatures(unittest.TestCase):
+    def test_hp_trend_keeps_a_straight_line(self):
+        y = np.linspace(0, 3, 100)
+        self.assertLess(np.max(np.abs(F.hp_trend(y) - y)), 0.05)
+
+    def test_no_look_ahead(self):
+        rng = np.random.default_rng(3)
+        y, mo = np.cumsum(rng.normal(0, .02, 120)), np.tile(np.arange(1, 13), 10)
+        X1 = F.build_features(y, mo, np.zeros(120), np.zeros(13))
+        y2 = y.copy(); y2[70:] += 5
+        X2 = F.build_features(y2, mo, np.zeros(120), np.zeros(13))
+        np.testing.assert_allclose(X1[:70], X2[:70])
+        self.assertFalse(np.isnan(X1[F.LAGS:]).any())
+
+
+class TestEngine(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.A = E.analyze(D.build_market("x.csv", PRICE, CPI_B), fast=True)
+
+    def test_outputs(self):
+        a = self.A
+        self.assertAlmostEqual(sum(a["weights"].values()), 1.0, places=6)
+        self.assertGreater(a["now"]["fair"], 0); self.assertLess(a["now"]["low"], a["now"]["high"])
+        for h in (1, 2, 3):
+            o = a["outlook"][h]; self.assertLess(o["low_pct"], o["high_pct"]); self.assertAlmostEqual(sum(o["probs"].values()), 1.0, places=6)
+
+    def test_blend_beats_last_price(self):
+        t = self.A["fair_table"]
+        self.assertLess(t["Blend (used)"], t["Last price"])
+
+    def test_forecast_never_trusted_without_skill(self):
+        self.assertTrue((self.A["move_table"]["Trust in forecast %"].between(0, 100)).all())
+
+    def test_bundled_real_tomato_file(self):
+        f = Path(__file__).parent.parent / "data" / "APU0000712311.csv"
+        if f.exists():
+            a = E.analyze(D.build_market("t.csv", f.read_bytes()), fast=True)
+            self.assertTrue(1.0 < a["now"]["fair"] < 3.5); self.assertGreater(a["n"], 500)
+
+
+class TestAdvisor(unittest.TestCase):
+    FAIR = {"price": 100.0, "low": 96.0, "high": 104.0}
+
+    def test_verdicts(self):
+        f = lambda p: A.compare_to_fair(p, self.FAIR, 60, 100)["status"]
+        self.assertEqual((f(80), f(100), f(130)), ("underpriced", "fair", "overpriced"))
+
+    def test_floor(self):
+        v = A.compare_to_fair(90, self.FAIR, 120, 100)
+        self.assertGreaterEqual(v["suggested"], 126); self.assertTrue(v["underwater"])
+
+    def test_timing_rules(self):
+        self.assertEqual(A.sell_or_wait(CFG, OUT(.2), 100, 50, 2)["action"], "wait")
+        self.assertEqual(A.sell_or_wait(CFG, OUT(-.2), 100, 50, 2)["action"], "sell_now")
+        self.assertEqual(A.sell_or_wait(CFG, OUT(.4), 100, 50, 0)["action"], "sell_now")
+        self.assertEqual(A.sell_or_wait(dict(CFG, hold=0.01), OUT(.03, np.random.default_rng(1).normal(0, .1, 300)), 100, 50, 2)["action"], "split")
+
+    def test_money(self):
+        self.assertEqual(A.money(1992.4), "$1,992"); self.assertEqual(A.money(1.99), "$1.99")
+
+
+class TestDemos(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.P = E.prepare(D.build_market("x.csv", PRICE, CPI_B))
+
+    def test_training_improves(self):
+        fr = list(L.train_live(self.P, epochs=40))
+        self.assertLess(fr[-1]["err"], fr[0]["err"])
+
+    def test_replay(self):
+        ev = L.shock_events(self.P)
+        self.assertTrue(ev)
+        d, flagged, kept = L.replay(self.P, ev[0]["i"])
+        self.assertLessEqual(kept, flagged); self.assertGreater(len(d), 20)
+
+
+if __name__ == "__main__":
+    unittest.main()
