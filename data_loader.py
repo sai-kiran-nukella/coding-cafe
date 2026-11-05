@@ -74,3 +74,45 @@ def fetch(url, timeout=20):
     except Exception as e:
         raise DataError(f"Download failed ({e.__class__.__name__}). Use the link to download the file, then upload it here.") from e
 
+
+def saved(key):
+    f = DATA / f"{key}.csv"
+    if not f.exists():
+        return None
+    meta = DATA / f"{key}.meta.json"
+    return {"name": f.name, "bytes": f.read_bytes(), "meta": json.loads(meta.read_text()) if meta.exists() else {}}
+
+
+def save(key, data, how, url=""):
+    DATA.mkdir(exist_ok=True)
+    (DATA / f"{key}.csv").write_bytes(data)
+    (DATA / f"{key}.meta.json").write_text(json.dumps({"fetched": pd.Timestamp.today().strftime("%Y-%m-%d"), "how": how, "source_url": url}))
+
+
+def normalise_upload(name, data):
+    """Uploaded file (any supported layout) to a clean date,value CSV so it can be reused later."""
+    s = read_series(name, data)
+    return s.rename("value").rename_axis("date").to_csv().encode()
+
+
+def build_market(price_name, price_bytes, cpi_bytes=None, today=None):
+    p = read_series(price_name, price_bytes)
+    info = {"first": p.index[0], "last": p.index[-1], "months": len(p), "filled": p.attrs.get("filled", 0), "weekly": p.attrs.get("weekly", False), "inflation": False}
+    today = pd.Timestamp(today or pd.Timestamp.today())
+    info["stale_months"] = (today.year - p.index[-1].year) * 12 + today.month - p.index[-1].month
+    if len(p) < 120:
+        raise DataError(f"Only {len(p)} months of data. At least 10 years (120 months) are needed to learn the market's patterns.")
+    cpi = None
+    if cpi_bytes is not None:
+        c = read_series("cpi.csv", cpi_bytes)
+        c = c.reindex(pd.date_range(min(c.index[0], p.index[0]), max(c.index[-1], p.index[-1]), freq="MS"))
+        gm = np.log(c.dropna()).diff().tail(6).mean()
+        for i in range(len(c)):
+            if np.isnan(c.iloc[i]) and i > 0 and c.index[i] > c.dropna().index[-1]:
+                c.iloc[i] = c.iloc[i - 1] * np.exp(gm)
+        c = c.interpolate(limit_area="inside")
+        start = max(p.index[0], c.first_valid_index())
+        p, c = p.loc[start:], c.loc[start:p.index[-1]]
+        if len(p) >= 120 and not c.isna().any():
+            cpi, info["inflation"], info["cpi_last"] = c, True, c.dropna().index[-1]
+    return {"price": p, "cpi": cpi, "info": info}
