@@ -1,67 +1,74 @@
 import copy
 import numpy as np
-from fair_price_net import YS, features
-from nn import Linear, Net
-from simulator import EVENTS, GOODS, simulate, training_paths
-
-SIZES = (5, 24, 12, 1)
-
-
-def _xy(df, good):
-    return features(good, df.cost, df.demand, df.comp, df.month), np.log(df.fair.values / GOODS[good]["p0"]) / YS
+import pandas as pd
+from engine import features_upto, fwd_mean
+from features import LAGS, NAMES, Scaler, hp_trend
+from nn import Net
 
 
-def _price(good, z):
-    return GOODS[good]["p0"] * np.exp(YS * np.ravel(z))
-
-
-def _ape(pred, true):
-    return float(np.mean(np.abs(pred - true) / true))
-
-
-def train_live(good, epochs=60, step=2, lr=0.01, seed=0):
-    """Yields the state of a brand-new network every `step` epochs."""
-    X, y = _xy(training_paths(good, 24, 60, 500 + seed), good)
-    val = simulate(good, 60, 9000 + seed, 1)
-    Xv, _ = _xy(val, good)
-    net, rng = Net(SIZES, seed), np.random.default_rng(seed)
-    lin_ape = _ape(_price(good, Linear(X, y).predict(Xv)), val.fair.values)
+def train_live(P, epochs=80, step=2, seed=0):
+    """Trains a brand-new fair-price network and yields its test accuracy as it learns."""
+    y, n = P["y"], P["n"]
+    T1 = int(0.70 * n)
+    T2 = min(T1 + int(0.10 * n), n - 24)
+    X, _, _ = features_upto(P, T1)
+    tr, va, te = np.arange(LAGS, T1 - 12), np.arange(T1, T2 - 12), np.arange(T2, n - 12)
+    L = hp_trend(y[:T1])[tr] - y[tr]
+    ls, sc, rng = L.std() + 1e-9, Scaler().fit(X[tr]), np.random.default_rng(seed)
+    net = Net((len(NAMES), 32, 16, 1), seed)
+    R = np.array([fwd_mean(y, t) for t in te])
+    base = {"12-month average": np.mean(np.abs(R - (y[te] - X[te, 6]))), "Last price": np.mean(np.abs(R - y[te]))}
     for e in range(0, epochs + 1, step):
         for k in range(step if e else 0):
-            net.epoch(X, y, lr * (0.05 + 0.95 * 0.5 * (1 + np.cos(np.pi * (e - step + k) / epochs))), 64, rng)
-        pred = _price(good, net.forward(Xv))
-        yield {"epoch": e, "ape": _ape(pred, val.fair.values), "linear_ape": lin_ape, "pred": pred, "true": val.fair.values}
+            net.epoch(sc(X[tr]), L / ls, 0.005 * (0.1 + 0.9 * 0.5 * (1 + np.cos(np.pi * (e - step + k) / epochs))), 32, rng, 1.5)
+        F = y[te] + ls * net.forward(sc(X[te])).ravel()
+        yield {"epoch": e, "err": 100 * float(np.mean(np.abs(R - F))), "base": {k: 100 * float(v) for k, v in base.items()},
+               "dates": P["dates"][te], "price": np.exp(y[te]), "realized": np.exp(R), "estimate": np.exp(F)}
 
 
-def calm_model(good, seed=0, epochs=80):
-    """A network that has only ever seen quiet markets."""
-    parts = [simulate(good, 60, 700 + seed * 100 + i, i % 12 + 1, event_prob=0) for i in range(24)]
-    X, y = zip(*[_xy(p, good) for p in parts])
-    X, y = np.vstack(X), np.concatenate(y)
-    net = Net(SIZES, seed)
-    net.fit(X, y, epochs, 0.01, rng=np.random.default_rng(seed))
-    val = simulate(good, 60, 9500 + seed, 5, event_prob=0)
-    e = np.abs(_price(good, net.forward(_xy(val, good)[0])) - val.fair.values) / val.fair.values
-    return net, X, y, float(e.mean()), float(e.std())
+def shock_events(P, k=3):
+    y, n = P["y"], P["n"]
+    gap = y - hp_trend(y)
+    out = []
+    for j in np.argsort(-np.abs(gap)):
+        if LAGS + 110 <= j <= n - 8 and all(abs(j - o["i"]) > 24 for o in out):
+            out.append({"i": int(j), "date": P["dates"][j], "gap": float(np.exp(gap[j]) - 1)})
+        if len(out) >= k:
+            break
+    return out
 
 
-def shock_test(good, event=0, shock_at=10, months=36, seed=3):
-    net, Xtr, ytr, m, s = calm_model(good)
-    plain, fixed, thr = copy.deepcopy(net), copy.deepcopy(net), max(0.03, m + 3 * s)
-    d = simulate(good, months, seed, 1, event_prob=0, force=(shock_at, event))
-    X, y = _xy(d, good)
-    rng, errs, rows, retrains = np.random.default_rng(1), [], [], 0
-    for t in range(months):
-        pa, pb = _price(good, plain.forward(X[t:t + 1]))[0], _price(good, fixed.forward(X[t:t + 1]))[0]
-        true = d.fair.values[t]
-        errs.append(abs(pb - true) / true)
-        retrained = len(errs) >= 2 and np.mean(errs[-2:]) > thr
-        if retrained:
-            k = min(12, t + 1)
-            j = rng.integers(0, len(Xtr), 150)
-            fixed.fit(np.vstack([np.repeat(X[t + 1 - k:t + 1], 6, axis=0), Xtr[j]]), np.concatenate([np.repeat(y[t + 1 - k:t + 1], 6), ytr[j]]), 25, 0.004, 32, rng)
-            retrains += 1
-        rows.append({"month": t + 1, "true": true, "no_repair": pa, "repair": pb, "err_plain": abs(pa - true) / true, "err_repair": abs(pb - true) / true,
-                     "retrained": bool(retrained), "shock": bool(d.active[t])})
-    import pandas as pd
-    return pd.DataFrame(rows), thr, retrains
+def replay(P, i, seed=0):
+    """Replays a real shock month by month. The fair-price label for month r (where prices settled over the next
+    12 months) is only known at month r+12. A frozen network is compared with one that tries to retrain when its
+    revealed errors grow, and keeps the update only if it does better on the newest revealed months."""
+    y, n = P["y"], P["n"]
+    s0, e0 = i - 6, min(i + 36, n - 13)
+    X, _, _ = features_upto(P, s0)
+    R = lambda t: fwd_mean(y, t)
+    tr = np.arange(LAGS, s0 - 12)
+    sc, rng = Scaler().fit(X[tr]), np.random.default_rng(seed)
+    L = np.array([R(t) - y[t] for t in tr])
+    ls = L.std() + 1e-9
+    net = Net((len(NAMES), 32, 16, 1), seed)
+    net.fit(sc(X[tr]), L / ls, 150, 0.005, 32, rng, 1.5)
+    upd = copy.deepcopy(net)
+    pred = lambda m, t: y[t] + ls * m.forward(sc(X[t:t + 1]))[0, 0]
+    err = lambda m, rows: float(np.mean([abs(R(q) - pred(m, q)) for q in rows]))
+    thr = max(0.04, 2 * err(net, tr[-36:]))
+    rows, revealed, last, flagged_n, kept = [], [], -99, 0, 0
+    for t in range(s0, e0 + 1):
+        revealed.append(t - 12)
+        flagged = retrained = False
+        if len(revealed) >= 8 and t - last >= 3 and err(upd, revealed[-3:]) > thr:
+            flagged, last = True, t
+            flagged_n += 1
+            k, jj = revealed[-15:-3], rng.integers(0, len(tr), 150)
+            cand = copy.deepcopy(upd)
+            cand.fit(np.vstack([np.repeat(sc(X[k]), 6, axis=0), sc(X[tr][jj])]), np.concatenate([np.repeat([(R(q) - y[q]) / ls for q in k], 6), L[jj] / ls]), 25, 0.004, 32, rng, 1.5)
+            if err(cand, revealed[-3:]) < err(upd, revealed[-3:]):
+                upd, retrained, kept = cand, True, kept + 1
+        pf, pu = pred(net, t), pred(upd, t)
+        rows.append({"date": P["dates"][t], "settled": np.exp(R(t)), "frozen": np.exp(pf), "updating": np.exp(pu), "price": np.exp(y[t]),
+                     "err_frozen": abs(np.exp(R(t) - pf) - 1), "err_updating": abs(np.exp(R(t) - pu) - 1), "flagged": flagged, "retrained": retrained})
+    return pd.DataFrame(rows), flagged_n, kept
