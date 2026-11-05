@@ -1,55 +1,72 @@
-PRICEWISE
-=========
-A tool for small sellers (farmers, shopkeepers, makers, landlords) that answers two questions:
-  1. Is my price fair?
-  2. Should I sell now or wait?
-
-Two neural networks, written from scratch in NumPy, make the predictions.
-Prices are simulated for now. Real market data is the next step.
+PRICEWISE (real data version)
+=============================
+Checks whether a seller's price is fair and whether to sell now or wait, using REAL market data.
+The fair price here means the long-run, inflation-adjusted level the market keeps returning to.
+Short-run swings (a demand spike, a bad season) move the price away from it for a while.
+A lasting shift changes the fair price itself.
 
 
-HOW TO RUN
-----------
+RUN
+---
 1. pip install -r requirements.txt
 2. streamlit run app.py
 3. Tests: python -m unittest tests/test_core.py
 
-The first run trains the models (about 15 seconds) and saves them in the .cache folder.
+
+HOW THE DATA WORKS
+------------------
+Pick a market. The app recommends the best official file for it and shows the publisher,
+the page, a direct download link, the file format and how to cite it.
+  - "Download the recommended file" fetches it from the source and saves it in the data folder.
+  - Or upload your own CSV/Excel file (a date column and a price column, monthly or weekly, 10+ years).
+  - An inflation file (US CPI) is downloaded automatically so prices can be adjusted for inflation.
+Tomatoes and Copper come bundled (FRED data tables, downloaded Nov 2026) so they work straight away.
+
+Markets: Tomatoes, Eggs, Ground beef, Gasoline, Wheat, Copper, and Custom file.
+All recommended files are on FRED (Federal Reserve Bank of St. Louis); the underlying publishers are
+the U.S. Bureau of Labor Statistics, U.S. Energy Information Administration and the International Monetary Fund.
+Prices are in US dollars. Use "Your local price vs this benchmark" to adjust for your own market.
 
 
-HOW TO USE
-----------
-Enter your product, cost, price, quantity, demand, competition and urgency in the sidebar.
-You can also upload a CSV of your own monthly prices (needs a "price" column, at least 6 rows).
-
-The page has three sections:
-  1. Is your price fair?       Fair price, range, margin, profit, suggested price.
-  2. Sell now or wait?         Advice, income table, 12 month outlook, price forecast.
-  3. How the model learned     Live training, and a shock test that shows the model repairing itself.
+THE PAGE
+--------
+Data                    Recommended file, citation, upload, data quality checks.
+1. Is your price fair?  Fair price and range, verdict, suggested price, fair price history.
+2. Sell now or wait?    Advice, income table, seasonal pattern, 1-3 month forecast with ranges.
+3. How the model learned
+     Backtest           Accuracy on history the model never saw, compared with simple methods.
+     Live training      Trains a new network on this market while you watch.
+     Shock replay       Replays a real shock; a fixed network vs one that retrains on new information.
 
 
 FILES
 -----
-simulator.py         Pretend market: supply, demand, seasons, shocks. Creates the training data.
-market_feed.py       Gives the app the price history. Also reads your CSV.
-nn.py                Neural network from scratch, ensemble of 5, straight-line baseline.
-fair_price_net.py    Predicts the fair price from cost, demand, competition and month.
-trend_net.py         Predicts whether the price will rise, fall or stay flat in 1-2 months.
-models.py            Trains both models per product and caches them.
-advisor.py           Turns predictions into verdicts, advice, income table and outlook.
-learning_demo.py     Live training and the shock test with self-repair.
-charts.py            Plots.
-app.py               The Streamlit page.
-tests/test_core.py   15 automatic checks.
+sources.py         Recommended file for each market, links and citations.
+data_loader.py     Reads CSV/Excel, handles weekly data and gaps, downloads, saves, adjusts for inflation.
+features.py        Trend filter, seasonality and the 21 features the network sees (no look-ahead).
+nn.py              Neural network from scratch (Adam, L2, Huber loss, early stopping, ensembles).
+engine.py          Learns the market: rolling backtests, model blending, fair price, forecasts.
+advisor.py         Verdicts, suggested price, sell/wait/split decision, income table.
+learning_demo.py   Live training and shock replay.
+charts.py, app.py  The page.
+tests/test_core.py Automatic checks.
 
 
-HOW IT FITS TOGETHER
---------------------
-simulator -> training data -> nn + fair_price_net + trend_net (via models)
--> advisor (decisions) -> app (page, with charts and learning demo)
+HOW THE MODEL WORKS
+-------------------
+Prices are converted to log "today's money". A smoothing filter gives the long-run level in hindsight.
+A network learns to estimate that level using only past data. Its estimate is blended with simple methods
+(last price, 12 and 36 month averages, slow trend) with weights chosen from three rolling backtest windows,
+so a method only gets weight if it actually works on that market. Forecasts of 1-3 month moves are shrunk
+towards "no change" unless backtests show they beat it. Ranges come from the real backtest errors.
 
 
 LIMITS
 ------
-All prices are simulated, so accuracy figures describe the simulator and will be lower on real data.
-This is guidance, not financial advice.
+- On the real series tested (tomatoes, copper) the network helps most in trending markets; in
+  mean-reverting ones simple averages do as well. The blend and the "trust" figures reflect this honestly.
+- Short-term direction is hard to predict. Forecast trust is low or zero for some markets.
+- Retraining on new information is delayed (outcomes are known 12 months later), so the shock replay
+  shows both the gains and the losses.
+- Gasoline, Eggs, Ground beef and Wheat download links were not tested here; Tomatoes and Copper were
+  checked against the real FRED data. Guidance only, not financial advice.
