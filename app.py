@@ -1,289 +1,314 @@
-import datetime
+"""Native, light Streamlit UI: seller inputs, three numbered sections, optional details."""
+import os
+import uuid
 import json
-import pickle
-import time
+import hashlib
 from pathlib import Path
-import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
 import streamlit as st
 import advisor as A
-import charts
 import data_loader as D
+import storage as S
 import engine as E
-import learning_demo as L
-from sources import CPI, CUSTOM, MARKETS
+from sources import CITIES, SOURCE_URL
+from connector import fetch_city
+from ui_state import readiness, checks
 
-st.set_page_config(page_title="PriceWise", layout="wide")
-URGENCY = {"Flexible (up to 3 months)": 3, "Within 2 months": 2, "Within a month": 1, "This week": 0}
-CACHE, VERSION, SUMMARY = Path(__file__).parent / ".cache", 1, D.DATA / "summary.json"
-ss = st.session_state
+st.set_page_config(page_title='PriceWise', layout='wide')
+money = lambda v: '₹' + format(v, ',.2f')
+st.title('PriceWise')
+st.write('Check an offer. Compare your options. Keep track of your sales.')
+city = st.sidebar.selectbox('City', CITIES, key='city')
+frame = S.observations()
+catalogue, eligible, other_cities = readiness(frame, city)
+series = None
+chosen = None
+history = None
 
+if 'stock' not in st.session_state:
+    st.session_state.stock = 'My stock'
+st.sidebar.subheader('Market history')
+if len(eligible):
+    products = eligible['product'].drop_duplicates().tolist()
+    product = st.sidebar.selectbox('Product', products, key='history_product')
+    matches = eligible[eligible['product'].eq(product)].reset_index(drop=True)
+    labels = [f"{r['market']} · {r['variety']} · {r['grade']} · {r['basis']}" for r in matches.to_dict('records')]
+    index = st.sidebar.selectbox('Market and variety', range(len(labels)), format_func=lambda i: labels[i], key='history_choice')
+    chosen = matches.iloc[index]
+    mask = pd.Series(True, index=frame.index)
+    for k in D.KEY:
+        mask &= frame[k].eq(chosen[k])
+    history = frame.loc[mask].sort_values('date')
+    series = history.set_index('date').price
+    identity = '|'.join(str(chosen[k]) for k in D.KEY)
+    if st.session_state.get('_stock_context') != identity:
+        st.session_state.stock = chosen['product']
+        st.session_state._stock_context = identity
+    st.sidebar.caption(f"{chosen['observations']} reports · last report {chosen['latest']:%d %b %Y}")
+else:
+    st.sidebar.selectbox('Product', ['Add a qualifying history first'], disabled=True, key='unavailable_product')
+    st.sidebar.caption('Calculations work now. Market analysis needs a price history.')
 
-def show(fig):
-    st.pyplot(fig)
-    plt.close(fig)
+def close_import():
+    st.session_state['_show_import'] = False
 
-
-def link(label, url):
-    st.link_button(label, url) if hasattr(st, "link_button") else st.markdown(f"[{label}]({url})")
-
-
-@st.cache_resource(show_spinner=False)
-def get_analysis(dig, _md):
-    f = CACHE / f"analysis_v{VERSION}_{dig}.pkl"
-    try:
-        if f.exists():
-            return pickle.loads(f.read_bytes())
-    except Exception:
-        pass
-    a = E.analyze(_md)
-    try:
-        CACHE.mkdir(exist_ok=True)
-        f.write_bytes(pickle.dumps(a))
-    except OSError:
-        pass
-    return a
-
-
-def remember(name, a, cfg):
-    try:
-        s = json.loads(SUMMARY.read_text()) if SUMMARY.exists() else {}
-        o = a["outlook"][2]
-        s[name] = {"Latest data": f"{a['now']['date']:%b %Y}", "Price": A.money(a["now"]["price"], cfg["currency"]), "Fair price": A.money(a["now"]["fair"], cfg["currency"]),
-                   "Price vs fair": f"{a['now']['gap'] * 100:+.0f}%", "Next 2 months": f"{o['change_pct'] * 100:+.1f}% ({o['direction']}, {A.confidence_label(o['confidence'])} confidence)"}
-        D.DATA.mkdir(exist_ok=True)
-        SUMMARY.write_text(json.dumps(s))
-    except Exception:
-        pass
-
-
-# ---------------------------------------------------------------- sidebar: product
-S = st.sidebar
-S.header("Product")
-choice = S.selectbox("Market", list(MARKETS) + ["Custom file"])
-custom = choice == "Custom file"
-cfg = dict(CUSTOM if custom else MARKETS[choice])
-if custom:
-    cfg["noun"] = S.text_input("Unit (for example kg)", "unit")
-    cfg["hold"] = S.number_input("Cost of holding stock (% of value per month)", 0.0, 20.0, 1.0, 0.1) / 100
-    cfg["currency"] = S.text_input("Currency symbol", "$")
-    choice = S.text_input("Name of this market", "My market") or "My market"
-key, cur = cfg["series"], cfg["currency"]
-
-st.title("PriceWise")
-st.caption("Check whether your price is fair and whether to sell now or wait, using real market data.")
-
-# ---------------------------------------------------------------- data file
-st.header("Data")
-c1, c2 = st.columns([3, 2])
-with c1:
-    if custom:
-        st.write("Upload a CSV or Excel file with a date column and a price column. Monthly or weekly data, at least 10 years.")
-    else:
-        st.markdown(f"**Recommended file:** {cfg['title']}")
-        st.caption(f"{cfg['publisher']} | {cfg['frequency']} | US dollars {cfg['per']}")
-        st.caption(cfg["why"])
-        a, b = st.columns(2)
-        with a:
-            link("Open source page", cfg["page"])
-        with b:
-            link("Direct file download", cfg["csv"])
-        st.caption("Format: " + cfg["fmt"])
-        st.caption("Cite as: " + cfg["citation"])
-with c2:
-    if not custom and st.button("Download the recommended file", key=f"dl_{key}"):
+@st.dialog('Add price history', width='large', on_dismiss=close_import)
+def import_dialog():
+    st.write(f'Import a genuine CSV or Excel history for {city}, or a file with a city column.')
+    uploaded = st.file_uploader('Choose price history', type=['csv', 'xlsx'], key='history_file')
+    source = st.text_input('Publisher or source URL', key='source', placeholder='Name the source that published these prices')
+    c1,c2 = st.columns(2)
+    default_unit = c1.selectbox('Source price unit if absent from file', list(D.FACTORS), key='import_unit', index=1)
+    basis = c2.selectbox('Price basis if absent', ['wholesale','retail'], key='basis')
+    single = st.checkbox(f'This file is only for {city}; use that city if the column is missing', key='single_city')
+    if st.button('Validate and save history', key='import', type='primary'):
         try:
-            raw = D.fetch(cfg["csv"])
-            D.read_series("x.csv", raw)
-            D.save(key, raw, "Downloaded from the source", cfg["csv"])
+            if uploaded is None:
+                raise D.DataError('Choose a price-history file first.')
+            f, receipt = D.load_file(uploaded.name, uploaded.getvalue(), source, default_unit, basis, city if single else None)
+            S.save_observations(f, receipt)
+            saved_catalogue = D.catalogue(S.observations(), city)
+            ready_count = int(saved_catalogue.eligible.sum()) if len(saved_catalogue) else 0
+            st.session_state['_import_message'] = f"Saved {receipt['accepted']} rows; skipped {receipt['rejected']}. {ready_count} histories ready for {city}."
+            close_import()
             st.rerun()
-        except D.DataError as e:
+        except (D.DataError, ValueError) as e:
             st.error(str(e))
-    up = st.file_uploader("Or use a different file (CSV or Excel)", type=["csv", "xlsx", "xls", "txt"], key=f"up_{key}")
-    if up is not None:
-        try:
-            D.save(key + "_mine", D.normalise_upload(up.name, up.getvalue()), "Uploaded by you")
-        except D.DataError as e:
-            st.error(str(e))
-rec, mine = (None if custom else D.saved(key)), D.saved(key + "_mine")
-options = [n for n, v in (("Recommended file", rec), ("My uploaded file", mine)) if v]
-if not options:
-    st.info("Download the recommended file or upload your own to begin.")
-    st.stop()
-use = options[0] if len(options) == 1 else st.radio("File in use", options, horizontal=True)
-active = rec if use == "Recommended file" else mine
-
-cpi = D.saved("CPIAUCSL")
-if cpi is None and not ss.get("cpi_tried"):
-    ss["cpi_tried"] = True
-    try:
-        raw = D.fetch(CPI["csv"])
-        D.read_series("c.csv", raw)
-        D.save("CPIAUCSL", raw, "Downloaded from the source", CPI["csv"])
-        cpi = D.saved("CPIAUCSL")
-    except D.DataError:
-        pass
-if cpi is None:
-    with st.expander("Inflation file needed to adjust prices for inflation", expanded=True):
-        st.write(f"{CPI['title']} ({CPI['publisher']})")
-        link("Direct file download", CPI["csv"])
-        cu = st.file_uploader("Upload the inflation file", type=["csv"], key="cpi_up")
-        if cu is not None:
+    with st.expander('File columns and a blank template'):
+        st.write('Required: date, product, market, price. Use a city column for multi-city files. Optional: variety, grade, basis and unit.')
+        st.write('Dates: YYYY-MM-DD or DD/MM/YYYY. commodity, modal_price and arrival_date column names are also accepted.')
+        st.download_button('Download CSV template', b'date,city,product,market,variety,grade,basis,unit,price\n', 'pricewise_template.csv','text/csv')
+    with st.expander('Official sources and current-report collection'):
+        st.link_button('Open official Indian mandi data', SOURCE_URL)
+        st.write('The official API needs DATA_GOV_IN_API_KEY configured locally. A current report adds to stored history; it does not supply a complete historical dataset.')
+        if st.button('Fetch official city reports', key='fetch'):
             try:
-                D.read_series("c.csv", cu.getvalue())
-                D.save("CPIAUCSL", cu.getvalue(), "Uploaded by you")
+                f, receipt = fetch_city(os.getenv('DATA_GOV_IN_API_KEY',''),city)
+                S.save_observations(f, receipt)
+                st.session_state['_import_message'] = f'Saved {len(f)} official rows. Check history readiness below.'
+                close_import()
                 st.rerun()
-            except D.DataError as e:
+            except (D.DataError,ValueError) as e:
                 st.error(str(e))
-use_infl = S.checkbox("Adjust for inflation", value=cpi is not None, disabled=cpi is None)
-try:
-    md = D.build_market(active["name"], active["bytes"], cpi["bytes"] if (cpi and use_infl) else None)
-except D.DataError as e:
-    st.error(str(e))
-    st.stop()
-info = md["info"]
-st.caption(f"{info['months']} months of data, {info['first']:%b %Y} to {info['last']:%b %Y}"
-           + (f", weekly values averaged to months" if info["weekly"] else "") + (f", {info['filled']} missing months filled in" if info["filled"] else "")
-           + f". Inflation adjusted: {'yes' if info['inflation'] else 'no'}. Source file saved {active['meta'].get('fetched', '')}.")
-if info["stale_months"] > 3:
-    st.warning(f"The latest data point is {info['last']:%b %Y}, {info['stale_months']} months ago. Download a newer file for current advice.")
-if not info["inflation"]:
-    st.warning("Prices are not adjusted for inflation, so the fair price will follow the long-run drift of prices.")
 
-dig = D.digest(active["bytes"]) + (D.digest(cpi["bytes"]) if info["inflation"] else "n")
-with st.spinner(f"Learning this market from {info['months']} months of data (about 10 seconds the first time)..."):
-    A_ = get_analysis(dig, md)
-remember(choice, A_, cfg)
-now = A_["now"]
-
-# ---------------------------------------------------------------- sidebar: your numbers
-S.header("Your numbers")
-stp = float(10 ** (np.floor(np.log10(now["price"])) - 2))
-cost = S.number_input(f"Your cost per {cfg['noun']} ({cur})", min_value=0.0, value=round(0.6 * now["price"], 2), step=stp, key=f"cost_{choice}_{dig}")
-price = S.number_input(f"Your asking price per {cfg['noun']} ({cur})", min_value=0.0, value=round(now["price"], 2), step=stp, key=f"price_{choice}_{dig}")
-qty = S.number_input(f"Quantity ({cfg['noun']}s)", min_value=1.0, value=float(cfg["qty"]), step=1.0, key=f"qty_{choice}")
-urgency = S.selectbox("Need to sell", list(URGENCY), key=f"urg_{choice}")
-local = S.number_input("Your local price vs this benchmark (%)", -50.0, 100.0, 0.0, 1.0, key=f"loc_{choice}", help="Enter +5 if your market usually trades 5% above this series.")
-if price <= 0 or cost < 0:
-    st.error("Enter a positive asking price.")
-    st.stop()
-f = 1 + local / 100
-fair = {"price": now["fair"] * f, "low": now["low"] * f, "high": now["high"] * f}
-market = now["price"] * f
-v = A.compare_to_fair(price, fair, cost, market)
-rec_ = A.sell_or_wait(cfg, A_["outlook"], market, qty, URGENCY[urgency])
-
-# ---------------------------------------------------------------- 1. fair price
-st.header("1. Is your price fair?")
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Fair price", A.money(fair["price"], cur), f"{A.money(v['low'], cur)} to {A.money(v['high'], cur)}", delta_color="off")
-m2.metric("Market price today", A.money(market, cur), f"{now['gap'] * 100:+.0f}% vs fair", delta_color="off")
-m3.metric("Your margin", f"{v['margin_pct'] * 100:.0f}%")
-m4.metric("Profit at your price", A.money((price - cost) * qty, cur), f"{A.money((v['suggested'] - cost) * qty, cur)} at suggested", delta_color="off")
-{"underpriced": st.warning, "fair": st.success, "overpriced": st.error}[v["status"]](A.verdict_line(v, cur))
-if v["underwater"]:
-    st.caption("The fair price is within 3% of your cost.")
-left, right = st.columns([3, 2])
-with left:
-    show(charts.price_chart(cost, price, v["low"], v["high"], market, v["suggested"], cur))
-    yrs = st.radio("History shown", [5, 10, 20], index=1, horizontal=True, format_func=lambda y: f"{y} years")
-    show(charts.history_chart(A_["hist"], yrs, cur, "Market price and the model's fair price"))
-with right:
-    hl, mo = A_["half_life"], datetime.date.today().month
-    rows = [("Fair price (long-run, inflation-adjusted)", A.money(now["fair"], cur)), ("Price vs fair today", f"{now['gap'] * 100:+.1f}%"),
-            ("Gap halves in about", f"{hl:.1f} months" if hl else "no clear reversion"), (f"Seasonal effect in {datetime.date(2000, mo, 1):%B}", f"{A_['season'][mo] * 100:+.1f}%"),
-            ("Inflation assumed", f"{A_['infl_annual'] * 100:.1f}% per year")]
-    rows += [(f"Lasting shift {s['start']:%b %Y} to {s['end']:%b %Y}", f"{s['change'] * 100:+.0f}% in fair price") for s in A_["shifts"]]
-    st.table(pd.DataFrame(rows, columns=["What the data says", ""]).set_index("What the data says"))
-
-# ---------------------------------------------------------------- 2. sell or wait
-st.header("2. Sell now or wait?")
-st.info(rec_["line"])
-if rec_["risk"]:
-    st.caption(rec_["risk"])
-left, right = st.columns(2)
-with left:
-    if rec_["scenarios"]:
-        s, h = rec_["scenarios"], URGENCY[urgency]
-        st.table(pd.DataFrame({f"Income for {A.count(qty, cfg)}": [A.money(s["now"], cur), A.money(s["expected"], cur), A.money(s["bad"], cur), A.money(s["good"], cur)]},
-                              index=[cfg["now"], f"Wait {h} month{'s' if h > 1 else ''} (expected)", "Wait (bad case)", "Wait (good case)"]))
-    show(charts.season_chart(A_["season"]))
-    best = max(A_["season"], key=A_["season"].get)
-    st.caption(f"Seasonally strongest month: {datetime.date(2000, best, 1):%B} ({A_['season'][best] * 100:+.1f}% vs fair)." if A_["season_gain"] >= 0.04
-               else "No reliable seasonal pattern in this market.")
-with right:
-    show(charts.forecast_chart(A_["hist"], A_["outlook"], now["price"], cur))
-    mt = A_["move_table"]
-    st.caption("Trust in the forecast (from backtests): " + ", ".join(f"{int(r['Horizon (months)'])} month {r['Trust in forecast %']:.0f}%" for _, r in mt.iterrows()))
-
-# ---------------------------------------------------------------- 3. how it learned
-st.header("3. How the model learned")
-P = E.prepare(md)
-t1, t2, t3 = st.tabs(["Backtest", "Live training", "Shock replay"])
-with t1:
-    ft = A_["fair_table"]
-    st.write(f"Tested on {A_['windows']} windows of history the model had not seen. Error is the average gap between the fair price estimate and where prices actually settled over the next 12 months.")
-    a, b = st.columns(2)
-    with a:
-        st.table(pd.DataFrame({"Average error": [f"{100 * ft[k]:.1f}%" for k in ft]}, index=list(ft)).rename_axis("Method"))
-        st.caption("Blend weights: " + ", ".join(f"{k} {100 * w:.0f}%" for k, w in A_["weights"].items() if w >= 0.01))
-    with b:
-        show(charts.test_chart(A_["test"], cur))
-    cols = ["Horizon (months)", "Forecast error %", "'No change' error %", "Direction right %", "Direction right % (momentum)", "Direction right % (always flat)", "Trust in forecast %"]
-    st.table(mt[cols].round(1).assign(**{"Horizon (months)": mt["Horizon (months)"].astype(int)}).set_index("Horizon (months)"))
-with t2:
-    st.write("Trains a new network from scratch on this market and shows its accuracy on months it has never seen.")
-    go = st.button("Train", key="train")
-    info_ph, ch1, ch2 = st.empty(), st.empty(), st.empty()
-
-    def draw(fr, hist_df):
-        info_ph.caption(f"Epoch {fr['epoch']}: network error {fr['err']:.1f}%, 12-month average {fr['base']['12-month average']:.1f}%, last price {fr['base']['Last price']:.1f}%")
-        ch1.line_chart(hist_df, height=220)
-        ch2.line_chart(pd.DataFrame({"Market price": fr["price"], "Settled price": fr["realized"], "Network's fair price": fr["estimate"]}, index=fr["dates"]), height=240)
-
-    if go:
-        rows_ = []
-        for fr in L.train_live(P):
-            rows_.append({"epoch": fr["epoch"], "Network error %": fr["err"], "12-month average %": fr["base"]["12-month average"], "Last price %": fr["base"]["Last price"]})
-            draw(fr, pd.DataFrame(rows_).set_index("epoch"))
-            time.sleep(0.1)
-        ss["train_last"] = (dig, fr, pd.DataFrame(rows_).set_index("epoch"))
-    elif ss.get("train_last", (None,))[0] == dig:
-        draw(*ss["train_last"][1:])
-with t3:
-    evs = L.shock_events(P)
-    if not evs:
-        st.write("Not enough history to replay a shock.")
+# Keep the next action at the top, rather than in a long technical expander.
+status_col, action_col, guide_col = st.columns([3,1,1])
+with status_col:
+    if series is not None:
+        st.success(f'Market history ready · {city} · {chosen["product"]}')
     else:
-        st.write("Replays a real shock in this market. One network stays fixed. The other tries to retrain when its errors grow, and keeps the update only if it helps on the newest months.")
-        pick = st.selectbox("Shock", range(len(evs)), format_func=lambda k: f"{evs[k]['date']:%b %Y}: price {evs[k]['gap'] * 100:+.0f}% from fair")
-        go2 = st.button("Replay", key="replay")
-        sum_ph, r1, r2 = st.empty(), st.empty(), st.empty()
+        st.info(f'{city}: price history needed for market comparison and the model. Seller calculations are ready.')
+with action_col:
+    if st.button('Add price history', key='add_history_top', width='stretch'):
+        st.session_state['_show_import'] = True
+with guide_col:
+    guide = Path(__file__).parent/'docs'/'PriceWise_Quick_Guide.pdf'
+    if guide.exists():
+        st.download_button('One-page guide',guide.read_bytes(),'PriceWise_Quick_Guide.pdf','application/pdf',width='stretch')
+import_message = st.session_state.pop('_import_message', None)
+if import_message:
+    st.success(import_message)
 
-        def draw2(d, n, fl, kept):
-            d = d.iloc[:n].set_index("date")
-            r1.line_chart(d[["settled", "frozen", "updating"]].rename(columns={"settled": "Settled price", "frozen": "Fixed network", "updating": "Updating network"}), height=240)
-            r2.line_chart(d[["err_frozen", "err_updating"]].mul(100).rename(columns={"err_frozen": "Fixed network error %", "err_updating": "Updating network error %"}), height=200)
-            sum_ph.caption(f"{d.index[-1]:%b %Y}. Retraining attempted {fl} times, kept {kept}. Average error: fixed {100 * d.err_frozen.mean():.1f}%, updating {100 * d.err_updating.mean():.1f}%.")
+st.sidebar.subheader('Your stock and offer')
+st.sidebar.caption('Example numbers. Replace them with your actual costs and offers.')
+stock = st.sidebar.text_input('Stock name',key='stock')
+unit = st.sidebar.selectbox('Quantity unit',['kg','quintal','tonne','litre','dozen'],key='qty_unit')
+base = 'kg' if unit in ['kg','quintal','tonne'] else unit
+quantity = st.sidebar.number_input('Quantity',min_value=.01,value=500.,step=1.,key='quantity')
+cost = st.sidebar.number_input(f'Cost to grow / buy (₹ per {base})',min_value=0.,value=10.,key='cost')
+price_unit = st.sidebar.selectbox('Offer price unit',[base]+(['quintal','tonne'] if base=='kg' else []),key='price_unit_'+base)
+price = st.sidebar.number_input(f'Your offer (₹ per {price_unit})',min_value=0.,value=15.,key='price_'+price_unit)
+transport = st.sidebar.number_input('Transport (₹ total)',min_value=0.,value=300.,key='transport')
+with st.sidebar.expander('Fees, stock loss and other costs'):
+    other = st.number_input('Other costs (₹ total)',min_value=0.,value=0.,key='other')
+    fee = st.number_input('Commission / fees (%)',min_value=0.,max_value=99.,value=0.,key='fee')
+    loss = st.number_input('Weight / stock lost (%)',min_value=0.,max_value=100.,value=0.,key='loss')
+inputs = dict(quantity=quantity,quantity_unit=unit,cost=cost,price=price,price_unit=price_unit,transport=transport,other=other,fee=fee,loss=loss)
+try:
+    result = A.calculate(**inputs)
+except ValueError as e:
+    st.error(f'Check the seller inputs: {e}')
+    st.stop()
 
-        if go2:
-            d, fl, kept = L.replay(P, evs[pick]["i"])
-            for n_ in range(1, len(d) + 1):
-                draw2(d, n_, int(d.flagged.iloc[:n_].sum()), int(d.retrained.iloc[:n_].sum()))
-                time.sleep(0.07)
-            ss["replay_last"] = (dig, pick, d, fl, kept)
-        elif ss.get("replay_last", (None, None))[:2] == (dig, pick):
-            _, _, d, fl, kept = ss["replay_last"]
-            draw2(d, len(d), fl, kept)
+st.header('1. Check your price and profit')
+with st.container(border=True):
+    a,b,c = st.columns(3)
+    a.metric('Profit at your offer',money(result['profit']))
+    b.metric('Break-even price',money(result['break_even'])+f' / {base}' if result['break_even'] is not None else 'No saleable stock')
+    c.metric('Saleable stock',f"{result['saleable']:,.2f} {base}")
+    if result['profit']>0:
+        st.success(f"Your offer leaves {money(result['profit'])} after the costs you entered.")
+    elif result['profit']<0:
+        st.warning(f"This offer loses {money(-result['profit'])}. Review your selling price and costs.")
+    else:
+        st.info('This offer breaks even under your entered costs.')
+    with st.expander('Show the calculation'):
+        st.dataframe(pd.DataFrame({'Item':['Sale revenue','Cost of all starting stock','Fees, transport and other costs','Profit'], 'Amount (₹)':[result['revenue'],result['purchase'],result['expenses'],result['profit']]}),hide_index=True,width='stretch')
+    if series is not None:
+        if stock.strip().casefold()!=str(chosen['product']).strip().casefold():
+            st.info(f"The selected history is for {chosen['product']}; your stock is {stock}. Use matching products before comparing prices.")
+        elif chosen['unit']!=base:
+            st.info('The history and offer measure different units. Match the unit family before comparing prices.')
+        else:
+            recent=series.iloc[-30:];median=float(recent.median());lo,hi=recent.quantile([.25,.75]);gap=result['rate']/median-1
+            st.subheader('Your offer versus recorded prices')
+            p1,p2=st.columns(2)
+            p1.metric('Recent median',money(median)+f' / {base}')
+            p2.metric('Your offer versus median',f'{gap*100:+.1f}%')
+            st.caption(f"{chosen['market']} · {chosen['variety']} · {chosen['basis']} · last report {chosen['latest']:%d %b %Y}. The median is a historical reference, not a guaranteed fair price.")
+            st.line_chart(series.rename(f'Reported price (₹ / {base})'))
+            with st.expander('Price reference details'):
+                st.write(f'The middle half of the latest {len(recent)} reports ranges from {money(lo)} to {money(hi)} per {base}. This describes past prices; it is not a prediction interval.')
+            if chosen.age_days>7:
+                st.warning('These records are older than seven days. Treat this as a historical comparison.')
+    else:
+        st.write('Market comparison: waiting for a price history. The profit calculation above is available now.')
 
-# ---------------------------------------------------------------- overview and export
-if SUMMARY.exists():
-    try:
-        st.header("Markets analysed so far")
-        st.table(pd.DataFrame(json.loads(SUMMARY.read_text())).T.rename_axis("Market"))
-    except Exception:
-        pass
-res = pd.DataFrame([{"market": choice, "data_to": f"{now['date']:%Y-%m}", "your_cost": cost, "your_price": price, "fair_price": round(fair["price"], 4), "fair_low": round(v["low"], 4),
-                     "fair_high": round(v["high"], 4), "market_price": round(market, 4), "verdict": v["status"], "suggested_price": round(v["suggested"], 4), "advice": rec_["label"]}])
-S.download_button("Download result (CSV)", res.to_csv(index=False), "pricewise_result.csv", "text/csv")
+st.header('2. Compare your selling options')
+waiting_tab,buyer_tab,sales_tab = st.tabs(['Sell now or wait','Compare buyers','Sales book'])
+with waiting_tab:
+    with st.container(border=True):
+        st.write('Change the assumptions below to compare selling today with waiting.')
+        c1,c2,c3=st.columns(3)
+        days=c1.number_input('Days to wait',min_value=0,max_value=365,value=3,key='days')
+        shelf=c2.number_input('Days stock stays saleable',min_value=0,max_value=365,value=7,key='shelf')
+        storage=c3.number_input('Storage (₹ / day, whole lot)',min_value=0.,value=50.,key='holding')
+        change=st.slider('Assumed selling-price change (%)',-50,100,5,key='change')
+        future_loss=st.number_input('Total stock lost if waiting (%)',min_value=0.,max_value=100.,value=5.,key='future_loss')
+        cash=st.checkbox('I need payment today',key='cash')
+        try:
+            wait=A.calculate(**{**inputs,'price':price*(1+change/100),'loss':future_loss,'days':days,'storage':storage})
+        except ValueError as e:
+            st.error(f'Check the waiting inputs: {e}')
+            st.stop()
+        n,w=st.columns(2)
+        n.metric('Profit if you sell now',money(result['profit']))
+        w.metric(f'Profit if you wait {days} days',money(wait['profit']))
+        if days>shelf or (cash and days>0):
+            st.warning('Waiting does not meet your shelf-life or payment deadline.')
+        else:
+            delta=wait['profit']-result['profit']
+            if delta>0:st.success(f'Waiting adds {money(delta)} under your assumptions.')
+            elif delta<0:st.success(f'Selling now keeps {money(-delta)} more under your assumptions.')
+            else:st.info('Both options leave the same profit under your assumptions.')
+        st.caption('The price change is your assumption, not a forecast. Storage is charged for the whole lot each day.')
+        with st.expander('See scenario amounts'):
+            st.dataframe(pd.DataFrame([{'Option':'Sell now','Revenue (₹)':result['revenue'],'Profit (₹)':result['profit']},{'Option':f'Wait {days} days','Revenue (₹)':wait['revenue'],'Profit (₹)':wait['profit']}]),hide_index=True)
+with buyer_tab:
+    with st.container(border=True):
+        c1,c2=st.columns(2)
+        second_price=c1.number_input(f'Second offer (₹ per {base})',min_value=0.,value=15.,key='second_price')
+        second_transport=c2.number_input('Second offer transport (₹ total)',min_value=0.,value=300.,key='second_transport')
+        try:
+            r2=A.calculate(**{**inputs,'price':second_price,'price_unit':base,'transport':second_transport})
+        except ValueError as e:
+            st.error(f'Check the second offer: {e}')
+            st.stop()
+        c1,c2=st.columns(2)
+        c1.metric('First offer profit',money(result['profit']))
+        c2.metric('Second offer profit',money(r2['profit']))
+        difference=r2['profit']-result['profit']
+        if difference>0:st.success(f'The second offer leaves {money(difference)} more profit.')
+        elif difference<0:st.success(f'The first offer leaves {money(-difference)} more profit.')
+        else:st.info('Both offers leave the same profit. Check payment reliability and convenience before choosing.')
+        st.caption('Quantity, stock loss, fees and other costs stay the same. Change the second buyer’s price and transport above.')
+with sales_tab:
+    st.write('Record the first offer only after the sale is complete.')
+    with st.form('sale_form',clear_on_submit=False):
+        sale_date=st.date_input('Sale date',value=D.today().date(),max_value=D.today().date(),key='sale_date')
+        buyer=st.text_input('Buyer / market',key='buyer');note=st.text_input('Note (optional)',key='sale_note')
+        done=st.checkbox('This sale is complete; these are the actual amounts',key='complete')
+        if st.form_submit_button('Record first offer as a completed sale'):
+            if not done or not buyer.strip():st.error('Confirm completion and enter a buyer.')
+            else:
+                row={'id':str(uuid.uuid4()),'date':str(sale_date),'city':city,'product':stock,'buyer':buyer.strip(),'note':note,'base_unit':base,**result}
+                S.add_sale(row);st.success('Sale saved to this local installation.')
+    sales=S.sales()
+    if sales:
+        st.dataframe(pd.DataFrame(sales).drop(columns=['id']),hide_index=True)
+        st.metric('Total recorded profit',money(sum(s['profit'] for s in sales)))
+        st.download_button('Export sales CSV',A.export_csv(sales),'pricewise_sales.csv','text/csv')
+        with st.expander('Delete a sale'):
+            delete=st.selectbox('Sale to remove',[r['id'] for r in sales],format_func=lambda i:next(f"{s['date']} | {s['buyer']} | {money(s['profit'])}" for s in sales if s['id']==i))
+            confirmation=st.checkbox('Permanently remove the selected sale',key='confirm_delete')
+            if st.button('Delete sale'):
+                if confirmation:S.delete_sale(delete);st.rerun()
+                else:st.error('Confirm deletion first.')
+    else:st.write('No completed sales recorded yet.')
+    st.download_button('Back up local records (SQL)',S.backup(),'pricewise_backup.sql','text/plain')
+report={'city':city,'stock':stock,'inputs':inputs,'result':result,'source':chosen['source'] if chosen is not None else None,'last_observation':str(chosen['latest']) if chosen is not None else None,'waiting_assumptions':{'days':days,'shelf_days':shelf,'price_change_pct':change,'loss_pct':future_loss,'storage_per_day':storage,'payment_today':cash},'waiting_result':wait,'second_offer':r2}
+st.download_button('Download calculation report',json.dumps(report,indent=2).encode(),'pricewise_report.json','application/json')
+
+st.header('3. Model and backtest')
+with st.container(border=True):
+    if series is None:
+        st.subheader('Waiting for price history')
+        st.write(f'The model has not run for {city}. Add a qualifying history to enable its backtest, training chart and replay.')
+        if other_cities:
+            st.info('History is saved for '+', '.join(other_cities)+'. Choose the matching city in the sidebar, or add history for '+city+'.')
+        if len(catalogue):
+            candidates=catalogue.reset_index(drop=True)
+            selected_check=st.selectbox('Check an uploaded history',range(len(candidates)),format_func=lambda i:f"{candidates.iloc[i]['product']} · {candidates.iloc[i]['market']} · {candidates.iloc[i]['variety']} · {candidates.iloc[i]['source']}",key='check_history')
+            candidate=candidates.iloc[selected_check]
+        else:
+            candidate=None
+        st.dataframe(checks(candidate),hide_index=True,width='stretch')
+        st.write('1. Add a genuine CSV or Excel history and its source.\n2. Save it, then select its product and market in the sidebar.\n3. Choose **Run model** here when the history is ready.')
+        if st.button('Add history for the model',key='add_history_model',type='primary'):
+            st.session_state['_show_import'] = True
+        with st.expander('Why a file may not qualify'):
+            st.write('Each history is checked separately by city, product, market, variety, grade, unit, retail/wholesale basis and source. Different series are not joined just to reach the minimum count.')
+            if len(catalogue):st.dataframe(catalogue[['product','market','observations','span_days','coverage','max_gap_days','reason']],hide_index=True)
+    else:
+        signature=hashlib.sha256(pd.util.hash_pandas_object(series,index=True).values.tobytes()+identity.encode()).hexdigest()
+        st.success(f'History ready: {len(series)} reports for {chosen["product"]} in {city}.')
+        st.caption('The model predicts the next reported observation. It does not promise a price for a specific sale date.')
+        if st.button('Run model',key='run_model',type='primary'):
+            st.session_state.pop('_analysis',None)
+            st.session_state.pop('_analysis_signature',None)
+            try:
+                with st.status('Training and checking unseen prices…',expanded=False) as status:
+                    a=E.analyze(series)
+                    st.session_state['_analysis']=a
+                    st.session_state['_analysis_signature']=signature
+                    status.update(label='Analysis ready: backtest, training and replay completed.',state='complete')
+            except (ValueError,FloatingPointError,ArithmeticError) as e:
+                st.error(f'The analysis could not finish: {e}. Review the selected history and try again.')
+        if st.session_state.get('_analysis_signature')==signature:
+            a=st.session_state['_analysis']
+            backtest,training,replay=st.tabs(['Backtest','Training','Historical replay'])
+            with backtest:
+                st.write(f"Selected using validation data: **{a['chosen']}**.")
+                m1,m2=st.columns(2)
+                m1.metric('Selected-method error',money(a['scores'][a['chosen']])+f" / {chosen['unit']}")
+                m2.metric('Last-price baseline error',money(a['scores']['Last price'])+f" / {chosen['unit']}")
+                if a['has_skill'] and chosen.age_days<=7:
+                    st.success(f"Next reported-price estimate: {money(a['forecast'])} per {chosen['unit']}.")
+                elif chosen.age_days>7:
+                    st.info('Backtest complete. A current forecast is withheld because the latest report is older than seven days.')
+                else:
+                    st.info('Backtest complete. The selected method did not improve enough on the last-price baseline, so no improved forecast is issued.')
+                st.line_chart(a['test'][['Observed',a['chosen']]].loc[:,lambda x:~x.columns.duplicated()])
+                with st.expander('All model errors and test details'):
+                    st.dataframe(pd.DataFrame({'Method':list(a['scores']),'Mean absolute error (₹)':list(a['scores'].values())}),hide_index=True)
+                    st.write(f"Final holdout improvement: {100*a['skill']:.1f}%. Training ended {a['train_end']:%d %b %Y}; validation ended {a['validation_end']:%d %b %Y}.")
+                    st.caption('First 60% training, next 20% validation, final 20% testing. Scaling fits training only. Published-vintage data is used; release delays are not simulated.')
+                st.download_button('Export backtest',a['test'].to_csv().encode(),'pricewise_backtest.csv','text/csv')
+            with training:
+                st.write(f"NumPy network trained. Best validation epoch: **{a['best_epoch']}**.")
+                st.line_chart(pd.Series(a['losses'],name='Training loss'))
+                st.caption('A falling training loss does not establish forecasting skill. Check the unseen backtest too.')
+            with replay:
+                step=st.slider('Reveal unseen reports',1,len(a['test']),1,key='replay_step_'+signature[:10])
+                st.line_chart(a['test'].iloc[:step][['Observed',a['chosen']]].loc[:,lambda x:~x.columns.duplicated()])
+                st.dataframe(a['test'].iloc[:step])
+        else:
+            st.info('Ready to train. Choose Run model to generate the backtest, training chart and historical replay for this selection.')
+    if series is not None:
+        with st.expander('Selected history and source'):
+            st.write(f"Source declared: {chosen['source']}. Latest observation: {chosen['latest']:%d %b %Y}.")
+            st.dataframe(checks(chosen),hide_index=True)
+            st.download_button('Export selected price history',A.export_csv(history.assign(date=history.date.dt.strftime('%Y-%m-%d')).to_dict('records')),'pricewise_history.csv','text/csv')
+
+if st.session_state.get('_show_import', False):
+    import_dialog()
