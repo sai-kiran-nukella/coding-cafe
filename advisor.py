@@ -1,60 +1,21 @@
-import numpy as np
+import math
+import csv
+import io
 
-FAIR_TOL, WAIT_GAIN, SELL_LOSS = 0.04, 0.025, -0.005
+def calculate(quantity,quantity_unit,cost,price,price_unit,transport=0,other=0,fee=0,loss=0,days=0,storage=0):
+    factors={'kg':('weight',1),'quintal':('weight',100),'tonne':('weight',1000),'litre':('volume',1),'dozen':('count',1)}
+    if quantity_unit not in factors or price_unit not in factors or factors[quantity_unit][0]!=factors[price_unit][0]:raise ValueError('Quantity and price units must measure the same thing.')
+    values=[quantity,cost,price,transport,other,fee,loss,days,storage]
+    if any(not math.isfinite(v) or v<0 for v in values) or quantity<=0 or fee>=100 or loss>100:raise ValueError('Use positive quantity, non-negative amounts, fees below 100% and loss up to 100%.')
+    base=quantity*factors[quantity_unit][1];sold=base*(1-loss/100);rate=price/factors[price_unit][1]
+    revenue=sold*rate;purchase=base*cost;expenses=revenue*fee/100+transport+other+days*storage
+    profit=revenue-purchase-expenses;be=(purchase+transport+other+days*storage)/(sold*(1-fee/100)) if sold else None
+    if any(not math.isfinite(v) for v in [base,sold,revenue,purchase,expenses,profit]+([be] if be is not None else [])):raise ValueError('Amounts are too large.')
+    return dict(quantity_base=base,saleable=sold,revenue=revenue,purchase=purchase,expenses=expenses,profit=profit,break_even=be,rate=rate)
 
-
-def money(v, cur="$"):
-    v = float(v)
-    s = f"{abs(v):,.2f}" if abs(v) < 1000 else f"{abs(v):,.0f}"
-    return ("-" if v < 0 else "") + cur + s
-
-
-def nice(v):
-    step = 0.05 if v < 10 else 0.5 if v < 100 else 1 if v < 1000 else 10
-    return round(v / step) * step
-
-
-def confidence_label(p):
-    return "high" if p >= 0.7 else "medium" if p >= 0.5 else "low"
-
-
-def count(qty, cfg):
-    n = cfg["noun"]
-    return f"{qty:,.0f} {n}" + ("s" if qty != 1 and n not in ("lb",) else "")
-
-
-def compare_to_fair(user_price, fair, cost, market_price):
-    lo, hi = min(fair["low"], fair["price"] * (1 - FAIR_TOL)), max(fair["high"], fair["price"] * (1 + FAIR_TOL))
-    gap = user_price / fair["price"] - 1
-    status = "underpriced" if user_price < lo else "overpriced" if user_price > hi else "fair"
-    floor = cost * 1.05
-    sug = {"underpriced": nice(fair["price"]), "overpriced": nice(hi), "fair": user_price}[status]
-    return {"status": status, "gap_pct": gap, "margin_pct": (user_price - cost) / user_price, "suggested": max(sug, floor) if status != "fair" else sug,
-            "floor": floor, "low": lo, "high": hi, "underwater": fair["price"] < cost * 1.03}
-
-
-def verdict_line(v, cur="$"):
-    if v["status"] == "fair":
-        return "Fair price."
-    return f"{'Underpriced' if v['status'] == 'underpriced' else 'Above fair price'} by {abs(v['gap_pct']) * 100:.0f}%. Suggested price: {money(v['suggested'], cur)}."
-
-
-def sell_or_wait(cfg, outlook, price_now, qty, horizon):
-    base = {"horizon": horizon, "qty": qty, "scenarios": None, "risk": ""}
-    if horizon == 0:
-        return {**base, "action": "sell_now", "label": cfg["now"], "net_gain_pct": 0.0, "confidence": outlook[1]["confidence"],
-                "line": "This week: no time to wait. Use the fair price as your guide."}
-    o, hold = outlook[horizon], cfg["hold"] * horizon
-    net = o["change_pct"] - hold
-    p_pos = float(np.mean(o["mu"] + np.array(o["resid"]) > np.log1p(hold)))
-    scen = {"now": qty * price_now, "expected": qty * price_now * (1 + net), "bad": qty * price_now * (1 + o["low_pct"] - hold), "good": qty * price_now * (1 + o["high_pct"] - hold)}
-    if net >= WAIT_GAIN and p_pos >= 0.6:
-        act, label = "wait", "Wait"
-    elif net <= SELL_LOSS or p_pos < 0.4:
-        act, label = "sell_now", cfg["now"]
-    else:
-        act, label = ("split", "Split: sell half now") if qty > 1 else ("sell_now", cfg["now"])
-    conf = o["probs"][o["direction"]]
-    return {**base, "action": act, "label": label, "net_gain_pct": net, "confidence": conf, "direction": o["direction"], "scenarios": scen,
-            "line": f"{label}. Expected {net * 100:+.0f}% over {horizon} month{'s' if horizon > 1 else ''} after allowing for {cfg['hold_why']} ({confidence_label(conf)} confidence).",
-            "risk": f"Chance that waiting is worse than {cfg['ing']} today: {min(95, max(5, round((1 - p_pos) * 100)))}%."}
+def export_csv(rows):
+    if not rows:return b''
+    out=io.StringIO();w=csv.DictWriter(out,fieldnames=list(rows[0]));w.writeheader()
+    for row in rows:
+        w.writerow({k:("'"+v if isinstance(v,str) and bool(v) and v[:1] in '=+@-' else v) for k,v in row.items()})
+    return out.getvalue().encode('utf-8-sig')
